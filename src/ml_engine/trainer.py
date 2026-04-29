@@ -120,6 +120,7 @@ def train_image_to_image(
     max_val_batches: int | None = None,
     grad_clip_norm: float | None = 1.0,
     psnr_data_range: float = 2.0,
+    log_fn: Callable[[dict[str, float]], None] | None = None,
 ) -> dict[str, list[float]]:
     """Train a simple image-to-image enhancement model.
 
@@ -177,6 +178,19 @@ def train_image_to_image(
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_metrics["loss"])
         history["val_psnr"].append(val_metrics["psnr"])
+
+        if log_fn is not None:
+            payload = {
+                "epoch": float(epoch + 1),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_metrics["loss"]),
+                "val_psnr": float(val_metrics["psnr"]),
+            }
+            try:
+                log_fn(payload)
+            except Exception:
+                # Logging must never crash training.
+                pass
 
         if getattr(getattr(train_loader, "dataset", None), "__len__", None) is not None:
             pass
