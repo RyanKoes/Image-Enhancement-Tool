@@ -14,12 +14,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Sequence, TypeAlias
+from typing import Callable, Iterator, Sequence, TypeAlias
 
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 from .degradation import DegradationConfig, DegradationPipeline
 
@@ -221,3 +221,110 @@ def default_div2k_hq_root(workspace_root: str | Path) -> Path:
 	"""Convenience helper for the repo's current DIV2K layout."""
 
 	return Path(workspace_root) / "data" / "kaggle" / "div2k_hr"
+
+
+class HFStreamingDataset(IterableDataset):
+	"""Wraps a HuggingFace streaming IterableDataset for ControlNet training.
+
+	Streams HQ images directly from the HF Hub — no local download needed.
+	LQ images are generated on-the-fly from the HQ via ``DegradationPipeline``.
+
+	Usage::
+
+		from datasets import load_dataset
+		hf_ds = load_dataset("eugenesiow/Div2k", "bicubic_x2",
+		                     split="train", streaming=True)
+		dataset = HFStreamingDataset(hf_ds, hq_key="hr")
+		loader  = DataLoader(dataset, batch_size=4)
+	"""
+
+	def __init__(
+		self,
+		hf_dataset,
+		*,
+		hq_key: str = "hr",
+		degradation: DegradationPipeline | None = None,
+		degradation_config: DegradationConfig | None = None,
+		transform: PairTransform | Callable[[ImageLike, ImageLike], tuple[torch.Tensor, torch.Tensor]] | None = None,
+		shuffle_buffer: int = 200,
+		seed: int | None = None,
+	) -> None:
+		self.hf_dataset = hf_dataset
+		self.hq_key = hq_key
+
+		if degradation is None:
+			degradation = DegradationPipeline(config=degradation_config)
+		self.degradation = degradation
+
+		self.transform = transform or PairTransform()
+		self.shuffle_buffer = int(shuffle_buffer)
+		self.seed = seed
+
+	def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+		rng = np.random.default_rng(self.seed)
+
+		ds = self.hf_dataset
+		if self.shuffle_buffer > 0:
+			# IterableDataset accepts buffer_size; regular Dataset does not.
+			try:
+				ds = ds.shuffle(seed=self.seed, buffer_size=self.shuffle_buffer)
+			except TypeError:
+				ds = ds.shuffle(seed=self.seed)
+
+		import urllib.request, io as _io, logging as _logging
+		_log = _logging.getLogger(__name__)
+
+		# Fail fast if the HF cache is entirely stale (e.g. Colab session restart
+		# wiped the extracted files).  After this many consecutive skips we raise
+		# a clear error rather than silently looping forever.
+		_MAX_CONSECUTIVE_SKIPS = 50
+		_consecutive_skips = 0
+
+		for item in ds:
+			raw = item[self.hq_key]
+			# HF datasets may return a PIL Image, a numpy array, a URL/path string,
+			# or a HuggingFace Image-feature dict {"path": str|None, "bytes": bytes|None}.
+			try:
+				if isinstance(raw, Image.Image):
+					hq = raw.convert("RGB")
+				elif isinstance(raw, dict):
+					# HuggingFace Image feature format
+					img_bytes = raw.get("bytes")
+					img_path  = raw.get("path")
+					if img_bytes:
+						hq = Image.open(_io.BytesIO(img_bytes)).convert("RGB")
+					elif img_path:
+						hq = Image.open(img_path).convert("RGB")
+					else:
+						raise FileNotFoundError("HF Image feature has neither bytes nor a valid path.")
+				elif isinstance(raw, str):
+					if raw.startswith("http://") or raw.startswith("https://"):
+						with urllib.request.urlopen(raw) as resp:  # noqa: S310
+							hq = Image.open(_io.BytesIO(resp.read())).convert("RGB")
+					else:
+						hq = Image.open(raw).convert("RGB")
+				else:
+					hq = Image.fromarray(np.asarray(raw)).convert("RGB")
+			except FileNotFoundError as exc:
+				_consecutive_skips += 1
+				if _consecutive_skips >= _MAX_CONSECUTIVE_SKIPS:
+					raise RuntimeError(
+						f"Stopped after {_consecutive_skips} consecutive missing images. "
+						"The HuggingFace dataset cache is stale (likely a Colab session restart "
+						"deleted the extracted image files). Fix: pass `cache_dir` pointing to a "
+						"persistent location (e.g. Google Drive) when calling `load_dataset`, so "
+						"extracted files survive across sessions. "
+						f"Last error: {exc}"
+					) from exc
+				_log.warning("Image file not found (stale HF cache path?); skipping item.")
+				continue
+			_consecutive_skips = 0  # reset on success
+
+			lq = self.degradation(hq, rng=rng)
+
+			try:
+				lq_t, hq_t = self.transform(lq, hq, rng=rng)  # type: ignore[call-arg]
+			except TypeError:
+				lq_t, hq_t = self.transform(lq, hq)
+
+			yield {"lq": lq_t, "hq": hq_t}
