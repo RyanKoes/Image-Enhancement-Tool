@@ -6,9 +6,7 @@ core of the system is a **ControlNet** conditioning network attached to a
 frozen **Stable Diffusion v1.5** backbone, trained first on natural images
 (DIV2K) and then fine-tuned on faces (FFHQ) for portrait restoration.
 
-> _Placeholder: hero image showing a side-by-side LQ → HQ comparison on a face._
->
-> `![Hero comparison](docs/img/hero_lq_vs_hq.png)`
+![Hero comparison](docs/img/hero_lq_vs_hq.png)
 
 ---
 
@@ -28,10 +26,7 @@ This repo contains two complementary pieces:
 | Baseline CNN | [src/ml_engine/](src/ml_engine), [notebooks/cnn.ipynb](notebooks/cnn.ipynb) | Reference encoder–decoder restoration model with W&B sweeps. |
 | LDM + ControlNet engine | [src/ldm_controlnet_engine/](src/ldm_controlnet_engine) | Latent diffusion restoration with a trained ControlNet. |
 
-> _Placeholder: architecture diagram showing VAE encoder → noisy latent → UNet
-> ⊕ ControlNet residuals → VAE decoder._
->
-> `![Architecture](docs/img/architecture.png)`
+![Architecture](docs/img/architecture.png)
 
 ---
 
@@ -93,7 +88,7 @@ encoder*, $\mathcal{C}_\phi$, that takes the conditioning signal and emits
 zero-initialized residuals which are added to the UNet's down-block and
 mid-block features.
 
-Concretely, my ControlNet ([models/controlnet.py](src/ldm_controlnet_engine/models/controlnet.py))
+Concretely, the ControlNet ([models/controlnet.py](src/ldm_controlnet_engine/models/controlnet.py))
 takes the **VAE-encoded LQ latent** $z_{LQ}$ and the timestep $t$ and produces
 
 $$
