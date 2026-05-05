@@ -32,121 +32,110 @@ This repo contains two complementary pieces:
 
 ## 2. The diffusion pipeline
 
-The quick summary of section 2, ignoring the math: the model learns to clean up images by playing a game in reverse. During training, take a sharp picture, slowly add random
-static onto it until it's pure noise, and teach a NN to
-guess what static was added at each step. Once it's good at that, we can hand
-it a blurry, noisy photo and say "pretend this is a half-finished cleanup —
-finish the job," and it will iteratively scrub away the noise to reveal a
-crisp image. To keep things fast, all of this happens on a compressed
-"summary" of the image (a latent) rather than on the full pixels, and a small
-add-on network called ControlNet basically hints to the main model what the messy input looks like.
+The model learns to clean up images by playing a game in reverse.
+During training we take a sharp picture, gradually add random static until
+it's pure noise, and teach a network to guess what static was added at each
+step. At inference, we hand it a blurry/noisy photo and say "pretend this is
+a half-finished cleanup — finish the job," and it iteratively scrubs the
+noise away. Two tricks keep this fast and useful:
+
+1. **Latent space.** All the noise/denoise work happens on a compressed
+   "summary" of the image (a $4 \times 32 \times 32$ latent from a pretrained
+   VAE), not on full pixels.
+2. **ControlNet.** A small add-on network looks at the messy input and tells
+   the main model *what scene* it's supposed to be reconstructing.
 
 ### 2.1 Latent diffusion
 
-A diffusion model defines a Markov forward process that gradually adds Gaussian
-noise to a clean sample $x_0$ over $T$ steps:
+**The forward process** slowly corrupts a clean image $x_0$ into pure noise
+over $T$ steps by adding a tiny bit of Gaussian noise each step. There's a
+handy closed form that lets us jump directly to any step $t$:
 
 $$
-q(x_t \mid x_{t-1}) = \mathcal{N}\!\left(x_t;\; \sqrt{1-\beta_t}\, x_{t-1},\; \beta_t I\right),
+q(x_t \mid x_0) = \mathcal{N}\!\left(x_t;\; \sqrt{\bar\alpha_t}\, x_0,\; (1-\bar\alpha_t) I\right).
 $$
 
-with a closed-form marginal
+Here $\bar\alpha_t$ shrinks from $\approx 1$ (clean) toward $0$ (pure noise)
+as $t$ grows — so $x_t$ is just "image plus a known amount of noise." The
+network $\epsilon_\theta(x_t, t)$ is trained to **predict that noise**, with
+the standard DDPM loss (Ho et al., 2020):
 
 $$
-q(x_t \mid x_0) = \mathcal{N}\!\left(x_t;\; \sqrt{\bar\alpha_t}\, x_0,\; (1-\bar\alpha_t) I\right),
-\qquad \bar\alpha_t = \prod_{s=1}^{t}(1-\beta_s).
+\mathcal{L}_{\text{simple}} = \mathbb{E}\!\left[\, \lVert \epsilon - \epsilon_\theta(x_t, t) \rVert_2^2 \,\right].
 $$
 
-A network $\epsilon_\theta(x_t, t)$ is trained to predict the noise that was
-added, with the simplified DDPM objective from Ho et al. (2020):
+Following Rombach et al. (2022), the whole process runs in the **latent
+space** of a pretrained VAE rather than on pixels:
 
 $$
-\mathcal{L}_{\text{simple}} = \mathbb{E}_{x_0,\, \epsilon \sim \mathcal{N}(0,I),\, t}
-\left[\, \lVert \epsilon - \epsilon_\theta(x_t, t) \rVert_2^2 \,\right].
-$$
-
-Following Rombach et al. (2022, *High-Resolution Image Synthesis with Latent
-Diffusion Models*), I ran the entire forward/reverse process in the latent
-space of a pretrained VAE rather than in pixel space:
-
-$$
-z_0 = \mathcal{E}(x_0) \cdot s, \qquad x_0 \approx \mathcal{D}(z_0 / s),
+z_0 = s \cdot \mathcal{E}(x_0), \qquad x_0 \approx \mathcal{D}(z_0 / s),
 $$
 
 where $\mathcal{E}, \mathcal{D}$ are the VAE encoder/decoder and
-$s = 0.18215$ is the canonical Stable Diffusion latent scaling constant
+$s = 0.18215$ is the standard Stable Diffusion scaling constant
 (see [forward_pass.py](src/ldm_controlnet_engine/training/forward_pass.py#L21)).
-For a $256 \times 256$ RGB input the latent is $4 \times 32 \times 32$, which
-is what makes large-image diffusion tractable on a single GPU.
+A $256 \times 256$ RGB image becomes a $4 \times 32 \times 32$ latent —
+~48× fewer values to denoise, which is what makes single-GPU training
+feasible.
 
 ### 2.2 ControlNet conditioning for restoration
 
-Vanilla Stable Diffusion is text-conditioned; It needs to be conditioned on a
-degraded image. **ControlNet** formulation (Zhang et al., 2023):
-freeze the pretrained UNet $\epsilon_\theta$ and train a *trainable copy of its
-encoder*, $\mathcal{C}_\phi$, that takes the conditioning signal and emits
-zero-initialized residuals which are added to the UNet's down-block and
-mid-block features.
+Stable Diffusion normally generates from a *text prompt*, but here we need to
+condition on a *degraded image* instead. **ControlNet** (Zhang et al., 2023)
+solves this by:
 
-Concretely, the ControlNet ([models/controlnet.py](src/ldm_controlnet_engine/models/controlnet.py))
-takes the **VAE-encoded LQ latent** $z_{LQ}$ and the timestep $t$ and produces
+- **Freezing** the pretrained UNet $\epsilon_\theta$.
+- Training a small **side network** $\mathcal{C}_\phi$ — a trainable copy of
+  the UNet's encoder — that looks at the LQ image and produces residuals.
+- **Injecting** those residuals into the frozen UNet's intermediate features.
 
-$$
-\mathcal{C}_\phi(z_{LQ}, t) = \big(\{r^{\text{down}}_i\}_{i=1}^{L},\; r^{\text{mid}}\big),
-$$
-
-which are injected into the frozen UNet:
+In other words, the frozen UNet is the "image expert" and ControlNet is a
+"hint generator" that nudges it toward the right scene:
 
 $$
-\hat\epsilon = \epsilon_\theta\!\left(z_t,\, t;\; \{r^{\text{down}}_i\},\, r^{\text{mid}}\right).
+\hat\epsilon = \epsilon_\theta\!\big(z_t,\, t;\; \mathcal{C}_\phi(z_{LQ}, t)\big).
 $$
 
-The output projections are `ZeroConv2d` layers (1×1 conv with zero-initialized
-weight and bias), so at step 0 of training the model is *exactly* the original
-Stable Diffusion UNet — training only ever adds signal. The channel multipliers
-`(1, 2, 4, 4)` and base width `320` are chosen specifically to match SD 1.5's
-`block_out_channels = (320, 640, 1280, 1280)` so the residuals are
-addition-compatible with the UNet feature maps.
+The residual heads are `ZeroConv2d` layers (1×1 convs initialized to zero),
+so on step 0 of training $\mathcal{C}_\phi$ outputs all zeros and the model
+behaves *exactly* like the original Stable Diffusion — training can only
+**add** signal, never break the prior. ControlNet's channel widths
+`(320, 640, 1280, 1280)` are picked to match SD 1.5's UNet so the residuals
+slot in cleanly.
 
 ### 2.3 Training objective
 
-For each training step (see [forward_pass.py](src/ldm_controlnet_engine/training/forward_pass.py)):
+Each training step (see [forward_pass.py](src/ldm_controlnet_engine/training/forward_pass.py)):
 
-1. Encode HQ and LQ to latents: $z_{HQ} = s \cdot \mathcal{E}(x_{HQ})$, $z_{LQ} = s \cdot \mathcal{E}(x_{LQ})$.
-2. Sample $t \sim \mathcal{U}\{0, \dots, T-1\}$ and $\epsilon \sim \mathcal{N}(0, I)$.
-3. Build the noisy target $z_t = \sqrt{\bar\alpha_t}\, z_{HQ} + \sqrt{1-\bar\alpha_t}\, \epsilon$ via the `DDPMScheduler`.
-4. Predict $\hat\epsilon = \epsilon_\theta(z_t, t;\, \mathcal{C}_\phi(z_{LQ}, t))$ with the **frozen** UNet and **trainable** ControlNet.
-5. Optimize $\phi$ only:
+1. Encode the HQ and LQ images to latents $z_{HQ}, z_{LQ}$.
+2. Pick a random timestep $t$ and a random noise $\epsilon$.
+3. Build a noisy version of the HQ latent: $z_t = \sqrt{\bar\alpha_t}\, z_{HQ} + \sqrt{1-\bar\alpha_t}\, \epsilon$.
+4. Ask the model "given $z_t$ and the LQ hint, what was $\epsilon$?"
+5. Loss = MSE between the true noise and the predicted noise:
 
 $$
-\mathcal{L}(\phi) = \mathbb{E}_{x_{HQ}, x_{LQ}, t, \epsilon}
-\big\lVert \epsilon - \epsilon_\theta(z_t, t;\, \mathcal{C}_\phi(z_{LQ}, t)) \big\rVert_2^2.
+\mathcal{L}(\phi) = \mathbb{E}\big\lVert \epsilon - \epsilon_\theta(z_t, t;\, \mathcal{C}_\phi(z_{LQ}, t)) \big\rVert_2^2.
 $$
 
-Because $\mathcal{E}$, $\mathcal{D}$, and $\epsilon_\theta$ are frozen, the
-only trainable parameters are the ControlNet weights $\phi$ — roughly an order
-of magnitude fewer parameters than the full UNet, which is what makes
-single-GPU training feasible.
+Only the ControlNet weights $\phi$ are updated — the VAE and UNet stay
+frozen — which is why this fits on a single GPU.
 
 ### 2.4 Inference (reverse process)
 
-At inference time ([inference/enhance.py](src/ldm_controlnet_engine/inference/enhance.py)) encode the LQ image to $z_{LQ}$, initialize $z_T \sim \mathcal{N}(0, I)$ at
-the same spatial resolution, and run the standard reverse DDIM/DDPM update for
-$t = T, T-1, \dots, 1$:
+At inference ([inference/enhance.py](src/ldm_controlnet_engine/inference/enhance.py))
+we run the recipe **in reverse**: encode the LQ image to $z_{LQ}$, start from
+pure noise $z_T \sim \mathcal{N}(0, I)$, and have the scheduler iteratively
+subtract the model's predicted noise from $t = T$ down to $t = 1$:
 
 $$
-z_{t-1} = \text{Step}\!\left(\hat\epsilon_t,\, t,\, z_t\right),
-\qquad \hat\epsilon_t = \epsilon_\theta\!\left(z_t, t;\, \mathcal{C}_\phi(z_{LQ}, t)\right),
+z_{t-1} = \text{Step}\!\big(\epsilon_\theta(z_t, t;\, \mathcal{C}_\phi(z_{LQ}, t)),\, t,\, z_t\big).
 $$
 
-before decoding $x_{\text{out}} = \mathcal{D}(z_0 / s)$. default to 50 DDIM
-steps with an unconditional (zero) cross-attention context, since this is a
-text-free restoration task.
+After the loop, decode the final latent back to a pixel image with the VAE:
+$x_{\text{out}} = \mathcal{D}(z_0 / s)$. Defaults are 50 DDIM steps with an
+empty (zero) text-prompt embedding, since restoration doesn't need text.
 
-> _Placeholder: grid of intermediate denoising steps ($z_T \to z_0$) for one
-> face, decoded back to pixel space._
->
-> `![Reverse process grid](docs/img/reverse_steps.png)`
+![Reverse process grid](docs/img/reverse_diffusion.png)
 
 ---
 
@@ -184,9 +173,9 @@ The first training stage targets generic image quality.
 Output checkpoints are written to `output/controlnet/checkpoint-XXXXXXX/controlnet.pt`,
 with a final `output/controlnet/final/controlnet.pt`.
 
-> _Placeholder: a few DIV2K validation triplets — HQ | LQ | restored._
->
-> `![DIV2K results](docs/img/div2k_grid.png)`
+I would encourage you to zoom in on these images to see what the model is generating from the noise.
+
+![DIV2K results](docs/img/div2k_example.png)`
 
 ---
 
@@ -204,17 +193,7 @@ Stage 2 adapts the model to the face domain.
 Two example portraits are checked in under [data/samples/](data/samples/) for
 qualitative validation:
 
-- [data/samples/brian_king.png](data/samples/brian_king.png)
-- [data/samples/ryan_koes.jpeg](data/samples/ryan_koes.jpeg)
-
-> _Placeholder: FFHQ fine-tuning before/after — Stage 1 checkpoint vs.
-> Stage 2 checkpoint on the same LQ face._
->
-> `![FFHQ fine-tune comparison](docs/img/ffhq_before_after.png)`
-
-> _Placeholder: enhanced versions of `brian_king.png` and `ryan_koes.jpeg`._
->
-> `![Sample restorations](docs/img/sample_faces.png)`
+![FFHQ fine-tune comparison](docs/img/Div2ktrain_vs_FFHQtrain.png)
 
 ---
 
