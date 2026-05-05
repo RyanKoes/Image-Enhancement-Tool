@@ -28,6 +28,29 @@ This repo contains two complementary pieces:
 
 ![Architecture](docs/img/architecture.png)
 
+### Key terms
+
+- **Diffusion.** A generative process that learns to turn random noise into
+  an image by reversing a gradual "add noise" corruption. Training shows the
+  model an image with a known amount of static and asks it to predict the
+  static; at inference, it starts from noise and removes a little bit at a
+  time over many steps until a clean image emerges.
+- **Latent space.** A compressed numerical representation of an image
+  produced by a pretrained autoencoder (VAE). Instead of working on the full
+  $256 \times 256 \times 3$ pixel grid, we work on a $4 \times 32 \times 32$
+  tensor that preserves the image's content but is ~48× smaller — making
+  diffusion fast enough to train on a single GPU.
+- **UNet.** The neural network that does the denoising at each diffusion
+  step. It has a U-shaped encoder–decoder shape with skip connections, so it
+  can mix global context (what the scene is) with local detail (edges,
+  texture). It takes a noisy latent plus the timestep $t$ and predicts the
+  noise to subtract.
+- **ControlNet.** A small "side" network bolted onto a frozen pretrained
+  UNet that injects an extra conditioning signal — in our case, the
+  low-quality input image. It tells the UNet *what scene to reconstruct*
+  while leaving Stable Diffusion's pretrained weights untouched, which
+  makes training cheap and stable (Zhang et al., 2023).
+
 ---
 
 ## 2. The diffusion pipeline
@@ -189,9 +212,6 @@ Stage 2 adapts the model to the face domain.
 - **Initialization:** `train(..., resume_from="output/controlnet/final/controlnet.pt")` — the Stage 1 weights are loaded and training continues, rather than re-initializing the ControlNet (see [train()](src/ldm_controlnet_engine/training/train_controlnet.py#L201)).
 - **Same loss, same degradation, same backbone** — only the dataset changes. The frozen SD 1.5 VAE + UNet stay frozen; only $\phi$ is updated.
 - **Why this works:** the SD 1.5 UNet already encodes a rich face prior (it was trained on web-scale data containing many portraits). The ControlNet only has to learn *"map blurry/noisy face latents to the conditioning that steers this prior toward the clean face manifold"* — a much smaller learning problem than training a face restorer from scratch.
-
-Two example portraits are checked in under [data/samples/](data/samples/) for
-qualitative validation:
 
 ![FFHQ fine-tune comparison](docs/img/Div2ktrain_vs_FFHQtrain.png)
 
